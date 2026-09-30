@@ -9,3 +9,4 @@ __pycache__/
 tfplan
 .venv312/
 .maestri/
+app/handler.zip
