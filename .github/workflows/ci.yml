@@ -3,8 +3,9 @@ name: ci
 on:
   pull_request:
 
-# Sem permissions aqui em cima de propósito: cada job declara o seu, para
-# nenhum job herdar (por descuido) mais do que precisa.
+# permissions vazio no topo: o checkov (CKV2_GHA_1) lê a omissão como write-all.
+# Assim nenhum job herda nada, e cada um declara só o que precisa.
+permissions: {}
 
 concurrency:
   group: ci-${{ github.ref }}
