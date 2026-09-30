@@ -29,13 +29,19 @@ data "aws_iam_policy_document" "gha_plan_trust" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      # Restrito ao evento pull_request do repositório específico; qualquer
-      # outra branch ou evento não consegue assumir este role. Usamos StringLike
-      # com :pull_request porque o GitHub usa sub = "repo:<org>/<repo>:pull_request"
-      # para PRs (sem número de PR no sub).
-      values = ["${local.github_subject_prefix}:pull_request"]
+      # Dois subjects aceitos (ADR 7): pull_request cobre o CI de PR;
+      # ref:refs/heads/main cobre o job plan do deploy.yml, que roda antes
+      # da aprovação do environment production e portanto não carrega o sub
+      # environment:production. Como gha-plan é só leitura, ampliar de onde
+      # pode ser assumido custa pouco; criar um terceiro role só aumentaria
+      # superfície de ataque. StringEquals (não StringLike) fecha qualquer
+      # outra branch ou evento que não seja exatamente esses dois valores.
+      values = [
+        "${local.github_subject_prefix}:pull_request",
+        "${local.github_subject_prefix}:ref:refs/heads/main",
+      ]
     }
   }
 }
