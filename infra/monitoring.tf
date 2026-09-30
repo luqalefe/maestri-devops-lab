@@ -59,27 +59,23 @@ resource "aws_cloudwatch_metric_alarm" "lambda_throttles" {
 
 resource "aws_cloudwatch_metric_alarm" "apigw_throttles" {
   alarm_name        = "${var.prefix}-apigw-throttles"
-  alarm_description = "O API Gateway descartou requisições por throttle no stage $default. Complementa o alarme de throttle da Lambda: o API GW throttle ocorre ANTES de a Lambda ser invocada, então os dois alarmes cobrem camadas diferentes."
+  alarm_description = "O API Gateway acumulou mais de 10 requisições 4xx em pelo menos um dos últimos 5 minutos. Complementa o alarme de throttle da Lambda: o API GW throttle ocorre ANTES de a Lambda ser invocada, então os dois alarmes cobrem camadas diferentes."
   namespace         = "AWS/ApiGateway"
   metric_name       = "4xx"
-  # A métrica de throttle do HTTP API v2 é publicada por ApiId+Stage;
-  # não existe dimensão "ThrottleCount" separada no HTTP API — 429s aparecem
-  # como 4xx com o filtro de status_code=429. Usar 4xx total é mais conservador
-  # (aciona com qualquer erro de cliente, não só throttle), mas para o
-  # laboratório isso é preferível a não ter cobertura de throttle no API GW.
+  # A métrica de throttle do HTTP API v2 é publicada como 4xx (429 incluído);
+  # não existe dimensão "ThrottleCount" separada no HTTP API.
   dimensions = {
     ApiId = aws_apigatewayv2_api.api.id
     Stage = "$default"
   }
   statistic = "Sum"
-  # 1 min captura picos de throttle com mais granularidade; o API GW publica
-  # métricas de 1 min por padrão, diferente da Lambda que usa 1 min também
-  # mas aqui queremos resposta rápida para abuso (ADR 2: API pública).
-  period             = 60
-  evaluation_periods = 5
-  # Limiar 10 em 5 min (5 × 60 s): tolera erros de cliente legítimos (400)
-  # sem acionar a cada requisição malformada isolada, mas detecta padrão
-  # de throttle ou ataque de scanning.
+  period    = 60
+  # evaluation_periods=5 com datapoints_to_alarm=1: dispara quando QUALQUER
+  # UM dos últimos 5 minutos ultrapassar 10 — captura rajadas mesmo que
+  # durem menos de 5 minutos. Sem datapoints_to_alarm, o padrão seria
+  # exigir os 5 períodos seguidos, o que deixaria uma rajada de 3 min passar.
+  evaluation_periods  = 5
+  datapoints_to_alarm = 1
   threshold           = 10
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
@@ -87,20 +83,20 @@ resource "aws_cloudwatch_metric_alarm" "apigw_throttles" {
 
 resource "aws_cloudwatch_metric_alarm" "apigw_latency_p95" {
   alarm_name        = "${var.prefix}-apigw-latency-p95"
-  alarm_description = "Latência p95 da API acima de 3 s nos últimos 5 minutos. Com timeout da Lambda em 10 s e cold start esperado de ~1-2 s em Python 3.12, 3 s cobre cold start sem alarmar no warm path; acima disso indica saturação ou regressão."
+  alarm_description = "Latência p95 ponta a ponta da API acima de 3 s. Com timeout da Lambda em 10 s e cold start esperado de ~1-2 s em Python 3.12, 3 s cobre cold start sem alarmar no warm path; acima disso indica saturação ou regressão."
   namespace         = "AWS/ApiGateway"
-  metric_name       = "IntegrationLatency"
+  # Latency mede o tempo total do API GW (receber requisição até devolver resposta),
+  # que inclui overhead do gateway além do backend. IntegrationLatency mede só
+  # o backend (Lambda); o briefing pede a latência da API, então usamos Latency.
+  metric_name = "Latency"
   dimensions = {
     ApiId = aws_apigatewayv2_api.api.id
     Stage = "$default"
   }
   # p95 exige extended_statistic, não statistic; os dois são mutuamente exclusivos.
-  extended_statistic = "p95"
-  period             = 300
-  evaluation_periods = 1
-  # 3000 ms = 3 s: cobre cold start (~1-2 s) + roundtrip DynamoDB (~5-10 ms
-  # em us-east-1 on-demand) com folga; abaixo de 3 s seria muito ruidoso
-  # num laboratório sem tráfego aquecido.
+  extended_statistic  = "p95"
+  period              = 300
+  evaluation_periods  = 1
   threshold           = 3000
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"

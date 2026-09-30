@@ -104,11 +104,34 @@ resource "aws_apigatewayv2_integration" "lambda" {
   payload_format_version = "2.0"
 }
 
-resource "aws_apigatewayv2_route" "proxy" {
-  # checkov:skip=CKV_AWS_309: API pública por decisão (ADR 2) — sem autenticação por design; o throttling é a única proteção intencional para o laboratório de um dia.
-
+# Quatro rotas explícitas em vez de $default: o handler.py roteia por
+# event["routeKey"] com os valores exatos "GET /tasks", "POST /tasks" etc.
+# Com $default o API GW enviaria routeKey="$default" e todo request viraria 404.
+resource "aws_apigatewayv2_route" "list_tasks" {
+  # checkov:skip=CKV_AWS_309: API pública por decisão (ADR 2); sem autenticação por design — o throttling é a única proteção intencional para o laboratório de um dia.
   api_id    = aws_apigatewayv2_api.api.id
-  route_key = "$default"
+  route_key = "GET /tasks"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "create_task" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "POST /tasks"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_task" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "GET /tasks/{id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "delete_task" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "DELETE /tasks/{id}"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 

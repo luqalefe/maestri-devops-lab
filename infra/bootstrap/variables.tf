@@ -1,5 +1,5 @@
-variable "github_repo" {
-  description = "Repositório no formato <org>/<repo> usado nos trusts OIDC. Entra por variável porque o repo ainda não existe quando o bootstrap é aplicado pela primeira vez."
+variable "github_immutable_subject_prefix" {
+  description = "Prefixo do subject OIDC imutável emitido pelo GitHub: repo:<org>@<org-id>/<repo>@<repo-id>. Obtido via: gh api repos/<org>/<repo>/actions/oidc/customization/sub. O subject imutável vincula os trusts aos IDs internos da organização e do repositório — um repo apagado e recriado com o mesmo nome não consegue assumir os roles (ADR 8)."
   type        = string
 }
 
