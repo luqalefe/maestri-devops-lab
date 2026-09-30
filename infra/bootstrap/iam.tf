@@ -2,15 +2,23 @@ locals {
   # ARN do provider OIDC do GitHub criado neste bootstrap.
   oidc_provider_arn = aws_iam_openid_connect_provider.github.arn
 
-  # Prefixo do subject claim enviado pelo GitHub Actions. O trust usa esse
-  # valor para restringir quais eventos podem assumir cada role.
-  github_subject_prefix = "repo:${var.github_repo}"
+  # ADR 8: o GitHub emite o subject com os IDs imutáveis da organização e do
+  # repositório (ex.: repo:luqalefe@105518587/maestri-devops-lab@1398582099).
+  # Usar o nome curto (repo:<org>/<repo>) deixaria os trusts assumíveis por
+  # qualquer repositório recriado com o mesmo nome após exclusão — o prefixo
+  # imutável fecha esse risco porque vincula o trust aos IDs, não aos nomes.
+  github_subject_prefix = var.github_immutable_subject_prefix
+
+  # ARN da policy da Lambda usada no gha-deploy para fechar o escalonamento
+  # (ADR 10): só essa policy pode ser anexada por AttachRolePolicy; qualquer
+  # tentativa de anexar AdministratorAccess ou outra policy é negada pela
+  # condição iam:PolicyARN mesmo que o chamador tenha iam:AttachRolePolicy.
+  lambda_basic_execution_policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 # ─── gha-plan ────────────────────────────────────────────────────────────────
-# Role assumido pelo CI de PR para rodar terraform plan -lock=false.
-# Só leitura: lê o state (s3:GetObject/ListBucket) e faz o refresh dos
-# recursos (ações de Get/List/Describe). Não escreve na AWS.
+# Role assumido pelo CI de PR e pelo job plan do deploy para rodar plan -lock=false.
+# Só leitura: lê o state e faz refresh. Não escreve nada na AWS.
 
 data "aws_iam_policy_document" "gha_plan_trust" {
   statement {
@@ -29,13 +37,16 @@ data "aws_iam_policy_document" "gha_plan_trust" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      # Restrito ao evento pull_request do repositório específico; qualquer
-      # outra branch ou evento não consegue assumir este role. Usamos StringLike
-      # com :pull_request porque o GitHub usa sub = "repo:<org>/<repo>:pull_request"
-      # para PRs (sem número de PR no sub).
-      values = ["${local.github_subject_prefix}:pull_request"]
+      # ADR 7: dois subjects — pull_request para o CI de PR e ref:refs/heads/main
+      # para o job plan do deploy (que roda sem environment, antes da aprovação).
+      # ADR 8: usamos o prefixo imutável; ver local.github_subject_prefix.
+      # StringEquals (não StringLike) fecha qualquer outro evento ou branch.
+      values = [
+        "${local.github_subject_prefix}:pull_request",
+        "${local.github_subject_prefix}:ref:refs/heads/main",
+      ]
     }
   }
 }
@@ -50,22 +61,19 @@ resource "aws_iam_role" "gha_plan" {
 }
 
 data "aws_iam_policy_document" "gha_plan_policy" {
-  # Permissões mínimas para que o terraform plan consiga ler o state e fazer
-  # refresh de cada recurso gerenciado em infra/. Nenhuma ação de escrita.
+  # Permissões mínimas para que o terraform plan leia o state e faça refresh
+  # de cada recurso em infra/. Nenhuma ação de escrita.
 
   statement {
     sid    = "LerStateBucket"
     effect = "Allow"
     actions = [
-      # GetObject lê o arquivo de state; GetObjectVersion lê versões antigas
-      # que o use_lockfile consulta para verificar se o lock foi liberado.
       "s3:GetObject",
       "s3:GetObjectVersion",
       # ListBucket é necessário para o backend S3 verificar a existência do
       # objeto de state antes de baixá-lo (retorna 403 sem essa permissão).
       "s3:ListBucket",
     ]
-    # Restrito ao bucket de state; não usa * para não dar acesso a todo S3.
     resources = [
       aws_s3_bucket.state.arn,
       "${aws_s3_bucket.state.arn}/*",
@@ -76,19 +84,11 @@ data "aws_iam_policy_document" "gha_plan_policy" {
     sid    = "RefreshDynamoDB"
     effect = "Allow"
     actions = [
-      # Necessário para o provider leia o estado atual da tabela no refresh.
       "dynamodb:DescribeTable",
       "dynamodb:DescribeContinuousBackups",
       "dynamodb:DescribeTimeToLive",
       "dynamodb:ListTagsOfResource",
     ]
-    # O ARN da tabela é criado pelo módulo infra/ e não está disponível no
-    # bootstrap. O plan de PR só precisa do refresh do provider, que usa
-    # o ARN do state — sem curingas em actions (cumprindo ADR 3/Regra 3).
-    # Usamos o ARN prefixado pela conta/região que será lida do state.
-    # checkov:skip=CKV_AWS_111: resources usa ARN construído com region/account
-    # que só existem em runtime; colocar * aqui quebraria o menor-privilégio
-    # mais do que o ARN parcial abaixo.
     resources = ["arn:aws:dynamodb:us-east-1:*:table/maestri-*"]
   }
 
@@ -109,28 +109,47 @@ data "aws_iam_policy_document" "gha_plan_policy" {
     sid    = "RefreshAPIGateway"
     effect = "Allow"
     actions = [
-      "apigatewayv2:GetApi",
-      "apigatewayv2:GetStage",
-      "apigatewayv2:GetIntegration",
-      "apigatewayv2:GetRoute",
-      "apigatewayv2:GetTags",
+      # O serviço IAM correto para HTTP API v2 é "apigateway" (não "apigatewayv2");
+      # o Terraform usa a API REST do plano de controle da AWS, que vive em
+      # apigateway:GET/POST/PATCH/DELETE independente do protocolo da API criada.
+      "apigateway:GET",
     ]
-    # API Gateway v2 não aceita ARN de recurso granular em todas as ações;
-    # o recurso mínimo possível é o ARN da API específica, mas sem o ID da
-    # API (gerado na criação) usamos o prefixo da conta.
-    # checkov:skip=CKV_AWS_111: ARN do API GW v2 exige o apiId que só existe
-    # após o apply; plan lê do state, não há como restringir antes da criação.
-    resources = ["arn:aws:apigateway:us-east-1::/apis/*"]
+    # checkov:skip=CKV_AWS_111: o ARN do API GW inclui o apiId gerado na criação;
+    # no plan/refresh de PR o ID ainda não é conhecido — usamos o prefixo da conta.
+    resources = ["arn:aws:apigateway:us-east-1::*"]
   }
 
   statement {
-    sid    = "RefreshLogs"
+    sid    = "RefreshLogsArn"
     effect = "Allow"
     actions = [
-      "logs:DescribeLogGroups",
       "logs:ListTagsForResource",
     ]
     resources = ["arn:aws:logs:us-east-1:*:log-group:/aws/lambda/maestri-*"]
+  }
+
+  statement {
+    sid    = "DescribeLogGroupsGlobal"
+    effect = "Allow"
+    actions = [
+      # logs:DescribeLogGroups não aceita ARN de recurso específico: a AWS
+      # ignora o ARN e retorna 403 ou lista vazia. Só funciona com resource "*".
+      # O provider usa essa ação no refresh do log group, então é necessária.
+      "logs:DescribeLogGroups",
+    ]
+    # checkov:skip=CKV_AWS_111: DescribeLogGroups só funciona com "*" por design
+    # da API do CloudWatch Logs — a AWS não aceita ARN de log group nessa ação.
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "RefreshCloudWatch"
+    effect = "Allow"
+    actions = [
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["arn:aws:cloudwatch:us-east-1:*:alarm:maestri-*"]
   }
 
   statement {
@@ -154,8 +173,7 @@ resource "aws_iam_role_policy" "gha_plan" {
 
 # ─── gha-deploy ──────────────────────────────────────────────────────────────
 # Role assumido pelo workflow de deploy para rodar terraform apply.
-# Trust restrito ao environment "production", que o GitHub exige aprovação
-# manual — sem essa condição, qualquer dispatch sem aprovação assumiria o role.
+# Trust restrito ao environment "production" (subject imutável, ADR 8).
 
 data "aws_iam_policy_document" "gha_deploy_trust" {
   statement {
@@ -174,11 +192,11 @@ data "aws_iam_policy_document" "gha_deploy_trust" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      # environment:production garante que só jobs que passaram pela aprovação
-      # do environment conseguem assumir este role; um dispatch sem aprovação
-      # gera um sub diferente e é rejeitado pela AWS antes mesmo de rodar.
+      # ADR 8: prefixo imutável garante que o trust não é assumível por um
+      # repositório recriado com o mesmo nome depois de excluído.
+      # environment:production força aprovação manual antes do apply (ADR 3).
       values = ["${local.github_subject_prefix}:environment:production"]
     }
   }
@@ -194,9 +212,6 @@ resource "aws_iam_role" "gha_deploy" {
 }
 
 data "aws_iam_policy_document" "gha_deploy_policy" {
-  # Permissões para criar, atualizar e destruir os recursos gerenciados em
-  # infra/. Divididas por serviço para facilitar auditoria e revisão futura.
-
   statement {
     sid    = "GerenciarStateBucket"
     effect = "Allow"
@@ -256,36 +271,27 @@ data "aws_iam_policy_document" "gha_deploy_policy" {
     sid    = "GerenciarAPIGateway"
     effect = "Allow"
     actions = [
-      "apigatewayv2:CreateApi",
-      "apigatewayv2:DeleteApi",
-      "apigatewayv2:GetApi",
-      "apigatewayv2:UpdateApi",
-      "apigatewayv2:CreateStage",
-      "apigatewayv2:DeleteStage",
-      "apigatewayv2:GetStage",
-      "apigatewayv2:UpdateStage",
-      "apigatewayv2:CreateIntegration",
-      "apigatewayv2:DeleteIntegration",
-      "apigatewayv2:GetIntegration",
-      "apigatewayv2:CreateRoute",
-      "apigatewayv2:DeleteRoute",
-      "apigatewayv2:GetRoute",
-      "apigatewayv2:TagResource",
-      "apigatewayv2:UntagResource",
-      "apigatewayv2:GetTags",
+      # O serviço IAM correto para HTTP API v2 é "apigateway" (plano de controle
+      # unificado da AWS). O Terraform usa GET/POST/PATCH/DELETE nesse serviço;
+      # "apigatewayv2" não é um serviço IAM válido — o Access Analyzer devolve
+      # INVALID_SERVICE_IN_ACTION para qualquer ação com esse prefixo.
+      "apigateway:GET",
+      "apigateway:POST",
+      "apigateway:PATCH",
+      "apigateway:DELETE",
+      "apigateway:PUT",
     ]
-    # checkov:skip=CKV_AWS_111: API GW v2 não permite restringir por ID de API
-    # antes do apply; o ARN da API é gerado dinamicamente pela AWS.
-    resources = ["arn:aws:apigateway:us-east-1::/apis/*"]
+    # checkov:skip=CKV_AWS_111: o ARN inclui o apiId gerado na criação; antes
+    # do primeiro apply não é possível restringir mais do que o prefixo abaixo.
+    resources = ["arn:aws:apigateway:us-east-1::*"]
   }
 
   statement {
-    sid    = "GerenciarLogs"
+    sid    = "GerenciarLogsArn"
     effect = "Allow"
     actions = [
       "logs:CreateLogGroup",
       "logs:DeleteLogGroup",
-      "logs:DescribeLogGroups",
       "logs:PutRetentionPolicy",
       "logs:DeleteRetentionPolicy",
       "logs:TagResource",
@@ -293,6 +299,34 @@ data "aws_iam_policy_document" "gha_deploy_policy" {
       "logs:ListTagsForResource",
     ]
     resources = ["arn:aws:logs:us-east-1:*:log-group:/aws/lambda/maestri-*"]
+  }
+
+  statement {
+    sid    = "DescribeLogGroupsGlobal"
+    effect = "Allow"
+    actions = [
+      # logs:DescribeLogGroups não aceita ARN de recurso específico: a AWS
+      # ignora o ARN e retorna 403 ou lista vazia. Só funciona com resource "*".
+      "logs:DescribeLogGroups",
+    ]
+    # checkov:skip=CKV_AWS_111: DescribeLogGroups só funciona com "*" por design
+    # da API do CloudWatch Logs — a AWS não aceita ARN de log group nessa ação.
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "GerenciarCloudWatch"
+    effect = "Allow"
+    actions = [
+      # Necessário para criar/destruir os quatro alarmes em monitoring.tf.
+      "cloudwatch:PutMetricAlarm",
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:TagResource",
+      "cloudwatch:UntagResource",
+      "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["arn:aws:cloudwatch:us-east-1:*:alarm:maestri-*"]
   }
 
   statement {
@@ -306,15 +340,49 @@ data "aws_iam_policy_document" "gha_deploy_policy" {
       "iam:PutRolePolicy",
       "iam:DeleteRolePolicy",
       "iam:GetRolePolicy",
-      "iam:AttachRolePolicy",
       "iam:DetachRolePolicy",
       "iam:ListAttachedRolePolicies",
       "iam:ListRolePolicies",
-      "iam:PassRole",
       "iam:TagRole",
       "iam:UntagRole",
     ]
     resources = ["arn:aws:iam::*:role/maestri-*"]
+  }
+
+  statement {
+    sid    = "AnexarPolicyPermitida"
+    effect = "Allow"
+    actions = [
+      # ADR 10: a condição iam:PolicyARN restringe AttachRolePolicy a uma lista
+      # explícita de policies gerenciadas. Sem ela, o gha-deploy consegue criar
+      # role/maestri-x com AdministratorAccess e ligar numa Lambda, tornando-se
+      # admin da conta — caminho provado pelo Revisor (simulate aprovou antes
+      # desta correção). A lista contém só a policy mínima usada pela infra.
+      "iam:AttachRolePolicy",
+    ]
+    resources = ["arn:aws:iam::*:role/maestri-*"]
+    condition {
+      test     = "ArnEquals"
+      variable = "iam:PolicyARN"
+      values   = [local.lambda_basic_execution_policy_arn]
+    }
+  }
+
+  statement {
+    sid    = "PassRoleLambda"
+    effect = "Allow"
+    actions = [
+      # ADR 10: a condição iam:PassedToService restringe PassRole a Lambda.
+      # Sem ela, o gha-deploy pode ligar um role de admin em outra Lambda
+      # ou serviço e executar código como admin.
+      "iam:PassRole",
+    ]
+    resources = ["arn:aws:iam::*:role/maestri-*"]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["lambda.amazonaws.com"]
+    }
   }
 }
 

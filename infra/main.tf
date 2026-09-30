@@ -1,7 +1,8 @@
 # ─── DynamoDB ────────────────────────────────────────────────────────────────
 
-#checkov:skip=CKV_AWS_119: CMK própria exigiria criar e gerir uma KMS key antes do apply; a chave gerenciada pelo DynamoDB (AWS_OWNED_CMK) cobre o laboratório de um dia sem custo ou dependência extra.
 resource "aws_dynamodb_table" "tasks" {
+  # checkov:skip=CKV_AWS_119: CMK própria exigiria criar e gerir uma KMS key antes do apply; a chave gerenciada pelo DynamoDB (AWS_OWNED_CMK) cobre o laboratório de um dia sem custo ou dependência extra.
+
   name         = "${var.prefix}-tasks"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "id"
@@ -39,13 +40,14 @@ data "archive_file" "lambda" {
 
 # ─── Lambda ──────────────────────────────────────────────────────────────────
 
-#checkov:skip=CKV_AWS_50: X-Ray tracing aumenta custo e complexidade; para o laboratório de um dia o CloudWatch Logs cobre o debug necessário.
-#checkov:skip=CKV_AWS_117: VPC exigiria NAT Gateway (proibido pelo ADR/Regra 4) para a Lambda alcançar DynamoDB; a API pública não tem dado sensível justificando o custo.
-#checkov:skip=CKV_AWS_116: DLQ faz sentido para Lambda assíncrona; esta é síncrona (invocada pelo API GW) e erros são retornados diretamente ao cliente como 5xx.
-#checkov:skip=CKV_AWS_173: TABLE_NAME é apenas o nome de um recurso AWS, não um segredo; criptografar variável de ambiente sem CMK não acrescenta proteção real.
-#checkov:skip=CKV_AWS_272: Code-signing exigiria AWS Signer e pipeline extra; o código vem do repositório com controle de acesso via OIDC, o que é controle equivalente para o laboratório.
-#checkov:skip=CKV_AWS_115: Concurrency limit reservado bloqueia capacidade global da conta; sem carga real num laboratório de um dia o throttling do API GW é suficiente.
 resource "aws_lambda_function" "api" {
+  # checkov:skip=CKV_AWS_50: X-Ray tracing aumenta custo e complexidade; para o laboratório de um dia o CloudWatch Logs cobre o debug necessário.
+  # checkov:skip=CKV_AWS_117: VPC exigiria NAT Gateway (proibido pelo ADR/Regra 4) para a Lambda alcançar DynamoDB; a API pública não tem dado sensível justificando o custo.
+  # checkov:skip=CKV_AWS_116: DLQ faz sentido para Lambda assíncrona; esta é síncrona (invocada pelo API GW) e erros são retornados diretamente ao cliente como 5xx.
+  # checkov:skip=CKV_AWS_173: TABLE_NAME é apenas o nome de um recurso AWS, não um segredo; criptografar variável de ambiente sem CMK não acrescenta proteção real.
+  # checkov:skip=CKV_AWS_272: Code-signing exigiria AWS Signer e pipeline extra; o código vem do repositório com controle de acesso via OIDC, o que é controle equivalente para o laboratório.
+  # checkov:skip=CKV_AWS_115: Concurrency limit reservado bloqueia capacidade global da conta; sem carga real num laboratório de um dia o throttling do API GW é suficiente.
+
   function_name    = "${var.prefix}-api"
   description      = "Lambda da API de tarefas — roteamento via routeKey do API Gateway HTTP API."
   filename         = data.archive_file.lambda.output_path
@@ -102,15 +104,40 @@ resource "aws_apigatewayv2_integration" "lambda" {
   payload_format_version = "2.0"
 }
 
-#checkov:skip=CKV_AWS_309: API pública por decisão (ADR 2) — sem autenticação por design; o throttling é a única proteção intencional para o laboratório de um dia.
-resource "aws_apigatewayv2_route" "proxy" {
+# Quatro rotas explícitas em vez de $default: o handler.py roteia por
+# event["routeKey"] com os valores exatos "GET /tasks", "POST /tasks" etc.
+# Com $default o API GW enviaria routeKey="$default" e todo request viraria 404.
+resource "aws_apigatewayv2_route" "list_tasks" {
+  # checkov:skip=CKV_AWS_309: API pública por decisão (ADR 2); sem autenticação por design — o throttling é a única proteção intencional para o laboratório de um dia.
   api_id    = aws_apigatewayv2_api.api.id
-  route_key = "$default"
+  route_key = "GET /tasks"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
-#checkov:skip=CKV_AWS_76: Access logging do API GW gera um segundo log group e exige permissão extra; o log da Lambda já cobre o debug para o laboratório de um dia.
+resource "aws_apigatewayv2_route" "create_task" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "POST /tasks"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_task" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "GET /tasks/{id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "delete_task" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "DELETE /tasks/{id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
 resource "aws_apigatewayv2_stage" "default" {
+  # checkov:skip=CKV_AWS_76: Access logging do API GW gera um segundo log group e exige permissão extra; o log da Lambda já cobre o debug para o laboratório de um dia.
+
   api_id      = aws_apigatewayv2_api.api.id
   name        = "$default"
   auto_deploy = true
