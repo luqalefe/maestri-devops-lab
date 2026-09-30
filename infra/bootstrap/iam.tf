@@ -113,10 +113,35 @@ data "aws_iam_policy_document" "gha_plan_policy" {
       # o Terraform usa a API REST do plano de controle da AWS, que vive em
       # apigateway:GET/POST/PATCH/DELETE independente do protocolo da API criada.
       "apigateway:GET",
+      # apigateway:TagResource / UntagResource / GetTags: o motor de IAM da AWS
+      # exige essas ações quando o provider envia tags inline em operações de
+      # criação/leitura. O Access Analyzer acusa ERROR dizendo que essas ações
+      # "não existem" — contradição documentada: quem manda é o motor de IAM,
+      # como provado pelo AccessDeniedException real no deploy de 2026-09-30
+      # (CreateStage falhou com "not authorized to perform: apigateway:TagResource").
+      # Remover essas ações pelo argumento do Access Analyzer garante 403 no próximo apply.
+      "apigateway:TagResource",
+      "apigateway:UntagResource",
+      "apigateway:GetTags",
     ]
     # checkov:skip=CKV_AWS_111: o ARN do API GW inclui o apiId gerado na criação;
     # no plan/refresh de PR o ID ainda não é conhecido — usamos o prefixo da conta.
     resources = ["arn:aws:apigateway:us-east-1::*"]
+  }
+
+  statement {
+    sid    = "LerChaveKMSState"
+    effect = "Allow"
+    actions = [
+      # O provider consulta kms:DescribeKey no refresh do bucket de state
+      # para validar o ARN da chave. O bucket usa SSE-KMS sem CMK explícita,
+      # mas a AWS ainda exige DescribeKey e Decrypt para ler os objetos.
+      # ARN confirmado via CloudTrail (AccessDenied em 2026-09-30) e via
+      # aws kms describe-key da chave edcc32bd-7f58-4fd2-8176-31aef4d6fc1f.
+      "kms:DescribeKey",
+      "kms:Decrypt",
+    ]
+    resources = ["arn:aws:kms:us-east-1:813875215626:key/edcc32bd-7f58-4fd2-8176-31aef4d6fc1f"]
   }
 
   statement {
@@ -280,10 +305,39 @@ data "aws_iam_policy_document" "gha_deploy_policy" {
       "apigateway:PATCH",
       "apigateway:DELETE",
       "apigateway:PUT",
+      # apigateway:TagResource / UntagResource / GetTags: o motor de IAM da AWS
+      # avalia essas ações quando o provider envia tags inline numa operação (ex.:
+      # CreateStage com o campo "tags" no body). O Access Analyzer acusa ERROR
+      # dizendo que essas ações "não existem" — contradição documentada: quem
+      # manda é o motor de IAM, como provado pelo AccessDeniedException real no
+      # deploy de 2026-09-30 (CreateStage falhou com "apigateway:TagResource").
+      # Remover essas ações pelo argumento do Access Analyzer garante 403 no próximo apply.
+      "apigateway:TagResource",
+      "apigateway:UntagResource",
+      "apigateway:GetTags",
     ]
     # checkov:skip=CKV_AWS_111: o ARN inclui o apiId gerado na criação; antes
     # do primeiro apply não é possível restringir mais do que o prefixo abaixo.
     resources = ["arn:aws:apigateway:us-east-1::*"]
+  }
+
+  statement {
+    sid    = "LerChaveKMSState"
+    effect = "Allow"
+    actions = [
+      # kms:DescribeKey: o provider consulta a chave KMS do bucket de state no
+      # refresh (e no s3:GetObject para descriptografar). O bucket usa SSE-KMS
+      # sem CMK explícita, mas a AWS ainda exige DescribeKey para validar a chave.
+      # Não usamos "*" porque o ARN da chave é conhecido e imutável.
+      # Confirmado via CloudTrail: AccessDenied em kms:DescribeKey em 2026-09-30
+      # (key arn:aws:kms:us-east-1:813875215626:key/edcc32bd-7f58-4fd2-8176-31aef4d6fc1f).
+      "kms:DescribeKey",
+      # Decrypt e GenerateDataKey são chamados pelo backend S3 no PutObject
+      # (gravar state) e GetObject (ler state) quando o bucket usa SSE-KMS.
+      "kms:Decrypt",
+      "kms:GenerateDataKey",
+    ]
+    resources = ["arn:aws:kms:us-east-1:813875215626:key/edcc32bd-7f58-4fd2-8176-31aef4d6fc1f"]
   }
 
   statement {
