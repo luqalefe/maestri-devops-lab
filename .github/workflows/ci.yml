@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  pull_request:
+
+# Sem permissions aqui em cima de propósito: cada job declara o seu, para
+# nenhum job herdar (por descuido) mais do que precisa.
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualidade:
+    # Este job não toca na AWS: sem id-token, nem se um step tentasse.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # 3.12 é o runtime da Lambda; testar em outra versão esconde erro de produção.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: pytest
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r app/requirements.txt -r app/requirements-dev.txt
+          .venv/bin/pytest -q app
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.4"
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      # -backend=false: validar não precisa do state, e este job não tem credencial.
+      # O bootstrap/ tem backend próprio, então cada diretório é validado por si.
+      - name: terraform init + validate
+        run: |
+          for dir in infra infra/bootstrap; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+      - name: tflint
+        run: |
+          tflint --init
+          tflint --recursive
+
+      # Em venv separado para o checkov não brigar com as dependências da app.
+      - name: checkov
+        run: |
+          python -m venv .venv-checkov
+          .venv-checkov/bin/pip install checkov
+          .venv-checkov/bin/checkov -d . --compact --quiet
+
+  plan:
+    needs: qualidade
+    # PR vindo de fork não recebe id-token; sem este filtro o job falharia
+    # em vez de simplesmente não rodar.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # wrapper desligado: ele injeta saída própria no stdout e suja o arquivo do plan.
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      # gha-plan é só leitura (ADR 3); o ARN vem de variável do repositório
+      # porque o repo no GitHub ainda não existe e o trust depende do nome dele.
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: terraform init
+        run: terraform -chdir=infra init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      # -lock=false (ADR 4): com use_lockfile o plan gravaria o .tflock no S3,
+      # e o role de PR não escreve no bucket. Plan não altera o state.
+      # Sem pipe de propósito: o shell padrão do Actions é bash -e, sem pipefail,
+      # e "plan | tee" devolveria o status do tee e deixaria o CI verde com o plan quebrado.
+      # Se falhar, o || imprime o que foi capturado e derruba o step.
+      - name: terraform plan
+        run: |
+          terraform -chdir=infra plan -lock=false -input=false -no-color > "$RUNNER_TEMP/plan.txt" 2>&1 \
+            || { cat "$RUNNER_TEMP/plan.txt"; exit 1; }
+          cat "$RUNNER_TEMP/plan.txt"
+
+      - name: Publicar o plan no PR
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const arquivo = `${process.env.RUNNER_TEMP}/plan.txt`;
+            let plan = fs.existsSync(arquivo) ? fs.readFileSync(arquivo, 'utf8') : '(o plan não gerou saída)';
+            // O comentário do GitHub aceita 65536 caracteres; o plan inteiro fica no log do job.
+            const limite = 60000;
+            if (plan.length > limite) {
+              plan = plan.slice(0, limite) + '\n... (cortado; plan completo no log do job)';
+            }
+            // Cerca mais longa que qualquer sequência de crases do plan: crase tripla
+            // dentro do plan fecharia o bloco e o resto viraria markdown solto.
+            const maior = Math.max(0, ...(plan.match(/`+/g) || []).map(c => c.length));
+            const cerca = '`'.repeat(Math.max(3, maior + 1));
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '### terraform plan\n\n' + cerca + '\n' + plan + '\n' + cerca,
+            });

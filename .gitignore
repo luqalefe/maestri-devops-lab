@@ -3,3 +3,9 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .venv312/
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+.venv312/
+.maestri/
