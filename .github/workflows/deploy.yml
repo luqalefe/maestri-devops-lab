@@ -55,12 +55,18 @@ jobs:
           cerca=$(printf '%*s' "$n" '' | tr ' ' '`')
           { echo '### terraform plan'; echo "$cerca"; cat plan.txt; echo "$cerca"; } >> "$GITHUB_STEP_SUMMARY"
 
+      # O commit planejado viaja com o plano: o apply só aceita o arquivo se a
+      # main ainda estiver nele.
+      - name: registrar commit planejado
+        run: echo "$GITHUB_SHA" > plan.sha
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tfplan
           path: |
             infra/tfplan
             app/handler.zip
+            plan.sha
             plan.txt
           if-no-files-found: error
           retention-days: 1
@@ -87,11 +93,29 @@ jobs:
         with:
           name: tfplan
 
+      # Três travas antes de tocar na AWS. O plano aprovado é a foto de UM commit:
+      # se a main andou, aplicá-lo seria aplicar código velho, e replanejar aqui
+      # tiraria de quem aprovou a garantia de ter visto o que vai acontecer.
+      # Então recusa e pede novo dispatch.
       # O zip da Lambda nasce do data.archive_file durante o plan e o apply do plano
       # salvo não re-lê o data source: o create da função lê o arquivo do disco.
-      # Falhar aqui é mais claro que o "no such file" no meio do apply.
-      - name: conferir artifact
-        run: test -f infra/tfplan && test -f app/handler.zip
+      - name: conferir plano
+        run: |
+          for f in infra/tfplan app/handler.zip plan.sha; do
+            [ -f "$f" ] || { echo "::error::artifact incompleto: falta $f"; exit 1; }
+          done
+          # Re-run de só o apply reaproveitaria este mesmo plano e a aprovação antiga.
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]; then
+            echo "::error::este plano já foi oferecido para apply (tentativa $GITHUB_RUN_ATTEMPT). Dispare o deploy de novo."
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin main
+          atual=$(git rev-parse FETCH_HEAD)
+          planejado=$(cat plan.sha)
+          if [ "$atual" != "$planejado" ]; then
+            echo "::error::a main andou desde o plano. Planejado em $planejado, main agora em $atual. Nada foi aplicado: dispare o deploy de novo para gerar e aprovar um plano novo."
+            exit 1
+          fi
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
