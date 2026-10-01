@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 
-TITULO_MAX = 200
+# Aumentado para caber descrição no mesmo campo, a pedido do uso real.
+TITULO_MAX = 200_000
 # Limite de tamanho da chave de partição do DynamoDB; acima disso a AWS
 # rejeita com ValidationException (o moto não), então o código valida antes.
 ID_MAX_BYTES = 2048
