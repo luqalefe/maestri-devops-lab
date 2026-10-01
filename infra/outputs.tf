@@ -12,3 +12,8 @@ output "lambda_function_name" {
   description = "Nome da função Lambda para facilitar invocação e debug manual."
   value       = aws_lambda_function.api.function_name
 }
+
+output "anexos_bucket" {
+  description = "Bucket S3 dos anexos de tarefa (objetos expiram em 1 dia)."
+  value       = aws_s3_bucket.anexos.bucket
+}

@@ -10,3 +10,4 @@ tfplan
 .venv312/
 .maestri/
 app/handler.zip
+tfdestroy

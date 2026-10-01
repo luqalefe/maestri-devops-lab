@@ -35,6 +35,27 @@ data "aws_iam_policy_document" "lambda_exec_policy" {
   }
 
   statement {
+    sid    = "AcessarAnexos"
+    effect = "Allow"
+    actions = [
+      # A URL pré-assinada herda as permissões de quem assina: se o role não
+      # puder PutObject/GetObject, a URL sai normal e só falha com 403 no
+      # cliente. ListBucket é o que faz um objeto ausente voltar 404 (e não
+      # 403) no head_object que o handler faz antes de assinar o download.
+      "s3:PutObject",
+      "s3:GetObject",
+    ]
+    resources = ["${aws_s3_bucket.anexos.arn}/anexos/*"]
+  }
+
+  statement {
+    sid       = "ListarAnexos"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.anexos.arn]
+  }
+
+  statement {
     sid    = "EscreverLogs"
     effect = "Allow"
     actions = [
