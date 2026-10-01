@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 # Aumentado para caber descrição no mesmo campo, a pedido do uso real.
@@ -16,12 +17,22 @@ ID_MAX_BYTES = 2048
 LIMITE_PADRAO = 50
 # 100 itens de ~1 KB ficam muito abaixo dos 6 MB de resposta da Lambda.
 LIMITE_MAX = 100
+# Curta de propósito: a URL é uma credencial ao portador, e o cliente a usa
+# logo depois de pedir.
+URL_EXPIRA_S = 300
 
 # A tabela é criada por chamada, não no import: o moto só intercepta o boto3
 # depois que o teste sobe o mock, e no Lambda o custo é desprezível (o
 # recurso é barato e o container é reaproveitado).
 def _tabela():
     return boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+
+def _s3():
+    # SigV4 explícito: é o único esquema que o S3 aceita em todas as regiões
+    # e o que o moto valida; o padrão do boto3 para URL pré-assinada pode
+    # cair no v2 conforme a versão.
+    return boto3.client("s3", config=Config(signature_version="s3v4"))
 
 
 def _serializar(obj):
@@ -199,11 +210,63 @@ def apagar_tarefa(event):
     return _resposta(204)
 
 
+def _chave_anexo(id_):
+    # Um anexo por tarefa: reenviar sobrescreve, e a chave sai só do id já
+    # validado, nunca de algo que o cliente escolha.
+    return f"anexos/{id_}"
+
+
+def _tarefa_existe(id_):
+    return "Item" in _tabela().get_item(Key={"id": id_})
+
+
+def url_upload_anexo(event):
+    """POST /tasks/{id}/anexo -> 200 {"url", "method": "PUT", "expires_in"}
+
+    O cliente envia o arquivo com PUT direto na URL; o corpo não passa pela
+    Lambda (limite de 6 MB) nem pelo API Gateway (10 MB).
+    """
+    id_ = _id_da_rota(event)
+    if not _id_valido(id_) or not _tarefa_existe(id_):
+        return _erro(404, "tarefa não encontrada")
+    url = _s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": os.environ["BUCKET_ANEXOS"], "Key": _chave_anexo(id_)},
+        ExpiresIn=URL_EXPIRA_S,
+    )
+    return _resposta(200, {"url": url, "method": "PUT", "expires_in": URL_EXPIRA_S})
+
+
+def url_download_anexo(event):
+    """GET /tasks/{id}/anexo -> 200 {"url", "method": "GET", "expires_in"}"""
+    id_ = _id_da_rota(event)
+    if not _id_valido(id_) or not _tarefa_existe(id_):
+        return _erro(404, "tarefa não encontrada")
+    s3 = _s3()
+    bucket, chave = os.environ["BUCKET_ANEXOS"], _chave_anexo(id_)
+    # Sem o head, a URL sairia para um objeto que não existe e o cliente
+    # receberia o XML de NoSuchKey do S3 em vez de um 404 nosso.
+    try:
+        s3.head_object(Bucket=bucket, Key=chave)
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return _erro(404, "anexo não encontrado")
+        raise
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": chave},
+        ExpiresIn=URL_EXPIRA_S,
+    )
+    return _resposta(200, {"url": url, "method": "GET", "expires_in": URL_EXPIRA_S})
+
+
 ROTAS = {
     "GET /tasks": listar_tarefas,
     "POST /tasks": criar_tarefa,
     "GET /tasks/{id}": buscar_tarefa,
     "DELETE /tasks/{id}": apagar_tarefa,
+    "POST /tasks/{id}/anexo": url_upload_anexo,
+    "GET /tasks/{id}/anexo": url_download_anexo,
 }
 
 

@@ -81,6 +81,36 @@ data "aws_iam_policy_document" "gha_plan_policy" {
   }
 
   statement {
+    sid    = "RefreshBucketAnexos"
+    effect = "Allow"
+    actions = [
+      # Lista que o provider 5.x lê no refresh de aws_s3_bucket (uma chamada
+      # Get* por atributo do bucket, mesmo os que não configuramos) mais as
+      # leituras dos recursos de public access block, criptografia, lifecycle
+      # e policy. Faltar uma só dá 403 no plan, não só no apply.
+      "s3:ListBucket",
+      "s3:GetBucketLocation",
+      "s3:GetBucketAcl",
+      "s3:GetBucketCORS",
+      "s3:GetBucketWebsite",
+      "s3:GetBucketVersioning",
+      "s3:GetAccelerateConfiguration",
+      "s3:GetBucketRequestPayment",
+      "s3:GetBucketLogging",
+      "s3:GetLifecycleConfiguration",
+      "s3:GetReplicationConfiguration",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetBucketObjectLockConfiguration",
+      "s3:GetBucketTagging",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketPublicAccessBlock",
+    ]
+    # Prefixo "maestri-anexos-" e não "maestri-*": este último casaria com o
+    # bucket de state (maestri-devops-lab-tfstate-...).
+    resources = ["arn:aws:s3:::maestri-anexos-*"]
+  }
+
+  statement {
     sid    = "RefreshDynamoDB"
     effect = "Allow"
     actions = [
@@ -251,6 +281,57 @@ data "aws_iam_policy_document" "gha_deploy_policy" {
       aws_s3_bucket.state.arn,
       "${aws_s3_bucket.state.arn}/*",
     ]
+  }
+
+  statement {
+    sid    = "GerenciarBucketAnexos"
+    effect = "Allow"
+    actions = [
+      # create: o bucket e uma chamada Put* por recurso de anexos.tf
+      # (tags, public access block, criptografia, lifecycle, policy).
+      "s3:CreateBucket",
+      "s3:PutBucketTagging",
+      "s3:PutBucketPublicAccessBlock",
+      "s3:PutEncryptionConfiguration",
+      "s3:PutLifecycleConfiguration",
+      "s3:PutBucketPolicy",
+      # refresh: as mesmas leituras do gha-plan.
+      "s3:ListBucket",
+      "s3:GetBucketLocation",
+      "s3:GetBucketAcl",
+      "s3:GetBucketCORS",
+      "s3:GetBucketWebsite",
+      "s3:GetBucketVersioning",
+      "s3:GetAccelerateConfiguration",
+      "s3:GetBucketRequestPayment",
+      "s3:GetBucketLogging",
+      "s3:GetLifecycleConfiguration",
+      "s3:GetReplicationConfiguration",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetBucketObjectLockConfiguration",
+      "s3:GetBucketTagging",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketPublicAccessBlock",
+      # destroy: o provider remove policy, depois esvazia (force_destroy
+      # lista e apaga objetos e versões) e só então apaga o bucket.
+      # Apagar public access block, criptografia e lifecycle usa as mesmas
+      # ações Put* de cima; não existe Delete* separado para elas no IAM.
+      "s3:DeleteBucketPolicy",
+      "s3:ListBucketVersions",
+      "s3:DeleteBucket",
+    ]
+    resources = ["arn:aws:s3:::maestri-anexos-*"]
+  }
+
+  statement {
+    sid    = "ApagarObjetosAnexos"
+    effect = "Allow"
+    actions = [
+      # Só o force_destroy usa; nenhuma leitura ou escrita de objeto.
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+    ]
+    resources = ["arn:aws:s3:::maestri-anexos-*/*"]
   }
 
   statement {

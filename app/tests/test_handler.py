@@ -1,8 +1,11 @@
 import base64
 import json
 import os
+import re
 from decimal import Decimal
 import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import boto3
 import pytest
@@ -12,6 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import handler as h  # noqa: E402
 
 TABELA = "tasks-teste"
+BUCKET = "anexos-teste"
+INFRA = Path(__file__).resolve().parents[2] / "infra"
 
 
 @pytest.fixture(autouse=True)
@@ -22,12 +27,14 @@ def ambiente(monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     monkeypatch.setenv("TABLE_NAME", TABELA)
+    monkeypatch.setenv("BUCKET_ANEXOS", BUCKET)
 
 
 @pytest.fixture
 def tabela(ambiente):
     with mock_aws():
         ddb = boto3.resource("dynamodb")
+        boto3.client("s3").create_bucket(Bucket=BUCKET)
         yield ddb.create_table(
             TableName=TABELA,
             KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
@@ -281,3 +288,64 @@ def test_id_acima_de_2048_bytes_nem_chega_ao_dynamodb(tabela, monkeypatch, rota)
 
     monkeypatch.setattr(h, "_tabela", nao_deveria_chamar)
     assert chamar(rota, id_="a" * 2049)["statusCode"] == 404
+
+
+# --- /tasks/{id}/anexo
+
+
+def test_post_anexo_devolve_url_de_upload_da_chave_da_tarefa(tabela):
+    t = criar()
+    r = chamar("POST /tasks/{id}/anexo", id_=t["id"])
+    assert r["statusCode"] == 200
+    corpo = json.loads(r["body"])
+    assert corpo["method"] == "PUT"
+    url = urlparse(corpo["url"])
+    assert url.scheme == "https"
+    assert BUCKET in corpo["url"]
+    assert url.path.endswith(f"/anexos/{t['id']}")
+    assert "X-Amz-Signature" in parse_qs(url.query)
+
+
+def test_post_anexo_tarefa_inexistente_retorna_404(tabela):
+    r = chamar("POST /tasks/{id}/anexo", id_="nao-existe")
+    assert r["statusCode"] == 404
+
+
+def test_get_anexo_sem_arquivo_enviado_retorna_404(tabela):
+    t = criar()
+    r = chamar("GET /tasks/{id}/anexo", id_=t["id"])
+    assert r["statusCode"] == 404
+    assert "anexo" in json.loads(r["body"])["error"]
+
+
+def test_get_anexo_tarefa_inexistente_retorna_404(tabela):
+    assert chamar("GET /tasks/{id}/anexo", id_="nao-existe")["statusCode"] == 404
+
+
+def test_get_anexo_devolve_url_de_download_do_objeto_enviado(tabela):
+    t = criar()
+    boto3.client("s3").put_object(
+        Bucket=BUCKET, Key=f"anexos/{t['id']}", Body=b"conteudo"
+    )
+    r = chamar("GET /tasks/{id}/anexo", id_=t["id"])
+    assert r["statusCode"] == 200
+    corpo = json.loads(r["body"])
+    assert corpo["method"] == "GET"
+    assert f"/anexos/{t['id']}" in corpo["url"]
+    assert "X-Amz-Signature" in parse_qs(urlparse(corpo["url"]).query)
+
+
+@pytest.mark.parametrize("rota", ["POST /tasks/{id}/anexo", "GET /tasks/{id}/anexo"])
+@pytest.mark.parametrize("id_", ["", "x" * 2049])
+def test_anexo_com_id_invalido_retorna_404(tabela, rota, id_):
+    assert chamar(rota, id_=id_)["statusCode"] == 404
+
+
+# --- contrato handler <-> infra
+
+
+def test_rotas_do_handler_existem_no_terraform():
+    # Rota só no handler = API Gateway responde 404 e a suíte continua verde
+    # (aconteceu na rodada 1). Aqui a divergência vira falha de teste.
+    declaradas = set(re.findall(r'route_key\s*=\s*"([^"]+)"', (INFRA / "main.tf").read_text()))
+    assert declaradas == set(h.ROTAS)

@@ -67,6 +67,8 @@ resource "aws_lambda_function" "api" {
       # A Lambda acessa a tabela pelo nome, não pelo ARN, porque o SDK boto3
       # resolve o endpoint automaticamente pela região do ambiente.
       TABLE_NAME = aws_dynamodb_table.tasks.name
+      # Mesmo critério da tabela: nome, não ARN, é o que o boto3 precisa.
+      BUCKET_ANEXOS = aws_s3_bucket.anexos.bucket
     }
   }
 
@@ -104,7 +106,7 @@ resource "aws_apigatewayv2_integration" "lambda" {
   payload_format_version = "2.0"
 }
 
-# Quatro rotas explícitas em vez de $default: o handler.py roteia por
+# Seis rotas explícitas em vez de $default: o handler.py roteia por
 # event["routeKey"] com os valores exatos "GET /tasks", "POST /tasks" etc.
 # Com $default o API GW enviaria routeKey="$default" e todo request viraria 404.
 resource "aws_apigatewayv2_route" "list_tasks" {
@@ -132,6 +134,23 @@ resource "aws_apigatewayv2_route" "delete_task" {
   # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
   api_id    = aws_apigatewayv2_api.api.id
   route_key = "DELETE /tasks/{id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+# Rota no handler sem rota aqui = API responde 404 com a suíte verde (foi o
+# que aconteceu na rodada 1); test_rotas_do_handler_existem_no_terraform
+# compara as duas listas.
+resource "aws_apigatewayv2_route" "upload_anexo" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "POST /tasks/{id}/anexo"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "download_anexo" {
+  # checkov:skip=CKV_AWS_309: idem — API pública, ADR 2.
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "GET /tasks/{id}/anexo"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
